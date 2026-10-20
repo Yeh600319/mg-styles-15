@@ -1,0 +1,52 @@
+{
+ "bpm": 90,
+ "beat": 0.6666667,
+ "step_fps": 12,
+ "hold_fps": 6,
+ "note": "all visual events sit on the 12 fps grid (1/12 s) and on the 90 bpm 16th grid (1/6 s). Dead air before the stamp = gap.",
+ "slap_mother": 0.3333333,
+ "tapes": [
+  0.6666667,
+  0.8333333
+ ],
+ "chip1936": 1.0,
+ "ad_in": 1.1666667,
+ "slap_ad": 1.5,
+ "chip1960": 1.8333333,
+ "hood": [
+  2.1666667,
+  2.5,
+  2.8333333
+ ],
+ "lemon_pop": 3.1666667,
+ "lemon_land": 3.5,
+ "band_red": 3.6666667,
+ "band_ink": 4.0,
+ "stamp_in": 4.5,
+ "windup": [
+  4.8333333,
+  5.6666667
+ ],
+ "gap": [
+  5.8333333,
+  6.1666667
+ ],
+ "hero": 6.1666667,
+ "lift": 6.6666667,
+ "manicules": [
+  6.8333333,
+  7.0
+ ],
+ "sheet_in": 7.3333333,
+ "sheet_slap": 7.6666667,
+ "title": [
+  7.8333333,
+  8.0,
+  8.1666667,
+  8.3333333
+ ],
+ "masthead": 8.6666667,
+ "build": 4.8333333,
+ "drop": 6.1666667,
+ "outro": 7.6666667
+}

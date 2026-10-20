@@ -1,0 +1,468 @@
+<!doctype html>
+<html><head><meta charset="utf-8">
+<title>异日观察室 · 拼贴</title>
+<style>html,body{margin:0;background:#efebe1;overflow:hidden}canvas{display:block}#svg{position:absolute;left:-9px;top:-9px;width:1px;height:1px;overflow:hidden}</style>
+</head><body><canvas id="c" width="1920" height="1080"></canvas>
+<svg id="svg" xmlns="http://www.w3.org/2000/svg"></svg>
+<script type="module">
+// yiri-collage — 异日观察室 2026-10-20「看起来坦诚，就值得相信吗？」 06-collage technique, Canvas2D.
+// Every frame is a pure function of t. Motion is quantised to 12 fps steps (resting pieces boil at 6 fps) with seeded
+// ±2 px hand-placement jitter. Ethics: the documentary mother-and-children piece is ONE silhouette cutout, moved only as a
+// whole (never split, warped or animated in parts), no facial detail. The car ad is a schematic of our own, not the original.
+const W = 1920, H = 1080, D = '/demos/yiri-collage/';
+window.DEMO = { width: W, height: H, fps: 30, duration: 10 };
+const cv = document.getElementById('c'), X = cv.getContext('2d');
+const C = await (await fetch(D + 'cues.json')).json();
+const load = src => new Promise((ok, no) => { const i = new Image(); i.onload = () => ok(i); i.onerror = () => no(src); i.src = src; });
+const I = {};
+await Promise.all([
+  (async () => I.paper = await load('/assets/textures/paper/Paper001_4K_color.jpg'))(),
+  (async () => I.grain = await load('/assets/textures/grain/grain_film35_2048.png'))(),
+  (async () => I.dust = await load('/assets/textures/dust/dust_01_3840x2160.png'))(),
+  (async () => I.tape = await load('/assets/textures/washi/washi_solid_14.png'))(),
+]);
+await Promise.all(Object.values(I).map(i => i.decode()));
+const CJK = '"WenQuanYi Zen Hei"', SERIF = '"Caladea"', SYM = '"DejaVu Sans"';
+for (const f of [`400 100px ${CJK}`, `700 100px ${SERIF}`, `400 100px ${SERIF}`, `400 100px ${SYM}`])
+  await document.fonts.load(f, '看起来坦诚，就值得相信吗？异日观察室这辆车没通过检验。纪实摄影汽车广告次品不合格本刊讯读者来信与修辞一张图则Lemon.UPON0123456789·—☛');
+await document.fonts.ready;
+
+// ------------------------------------------------------------------ palette + helpers
+const P = { paper: '#efebe1', ink: '#22282a', blue: '#3f6277', red: '#ad3f2c', news: '#e4ddcb', white: '#fbf9f3' };
+const PI = Math.PI, DEG = PI / 180;
+const clamp = (x, a = 0, b = 1) => Math.min(b, Math.max(a, x));
+const lerp = (a, b, u) => a + (b - a) * u;
+function hash(a, b = 0) { let h = (a * 374761393 + b * 668265263 + 1013904223) | 0; h = Math.imul(h ^ (h >>> 13), 1274126177); h ^= h >>> 16; return (h >>> 0) / 4294967296; }
+function rng(seed) { let s = seed >>> 0; return () => { s = (s + 0x6D2B79F5) | 0; let t = Math.imul(s ^ (s >>> 15), 1 | s); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; }; }
+const K = t => Math.floor(t * 12 + 1e-4);              // 12 fps step index
+const ks = (t, t0) => K(t) - Math.round(t0 * 12);       // steps since a cue
+function jit(id, t, amp = 2, fps = 12) {                // seeded hand-placement jitter (px, px, rad)
+  const k = Math.floor(t * fps + 1e-4);
+  return [(hash(id, k) * 2 - 1) * amp, (hash(id + 71, k) * 2 - 1) * amp, (hash(id + 913, k) * 2 - 1) * amp * 0.25 * DEG];
+}
+// slap: a piece comes down from "camera" and lands exactly on t0 (big + lifted → squash → settle)
+function slap(t, t0, pre = 3) {
+  const k = ks(t, t0);
+  if (k < -pre) return null;
+  if (k < 0) { const u = -k / pre; return { s: 1 + 0.42 * u * u + 0.04 * u, lift: u, k }; }
+  if (k === 0) return { s: 0.97, lift: 0, k };
+  if (k === 1) return { s: 1.012, lift: 0.04, k };
+  return { s: 1, lift: 0, k };
+}
+const mk = (w, h) => { const c = document.createElement('canvas'); c.width = Math.ceil(w); c.height = Math.ceil(h); return c; };
+const svg = document.getElementById('svg');
+function samplePath(d, step = 3) {                      // polyline from an SVG path string (used for scissor edges)
+  const p = document.createElementNS('http://www.w3.org/2000/svg', 'path'); p.setAttribute('d', d); svg.appendChild(p);
+  const L = p.getTotalLength(), n = Math.max(8, Math.ceil(L / step)), out = [];
+  for (let i = 0; i <= n; i++) { const q = p.getPointAtLength(L * i / n); out.push([q.x, q.y]); }
+  p.remove(); return out;
+}
+// scissor-cut polygon: straight-ish facets with small angular errors (hand-cut, not torn)
+function scissor(pts, seed, amp = 2.2, every = 9) {
+  const r = rng(seed), out = [];
+  for (let i = 0; i < pts.length; i += every) out.push([pts[i][0] + (r() * 2 - 1) * amp, pts[i][1] + (r() * 2 - 1) * amp]);
+  return out;
+}
+function poly(c, pts) { c.beginPath(); pts.forEach((p, i) => i ? c.lineTo(p[0], p[1]) : c.moveTo(p[0], p[1])); c.closePath(); }
+function rectPts(w, h, inset = 0) { return [[inset, inset], [w - inset, inset], [w - inset, h - inset], [inset, h - inset]]; }
+function cutRect(w, h, seed, amp = 5) {                 // a rectangle cut with scissors: 2–3 facets per side
+  const r = rng(seed), P0 = [], side = (a, b, n) => { for (let i = 0; i < n; i++) { const u = i / n; P0.push([lerp(a[0], b[0], u) + (r() * 2 - 1) * amp, lerp(a[1], b[1], u) + (r() * 2 - 1) * amp]); } };
+  const c = [[amp, amp], [w - amp, amp], [w - amp, h - amp], [amp, h - amp]];
+  side(c[0], c[1], 3); side(c[1], c[2], 2); side(c[2], c[3], 3); side(c[3], c[0], 2); return P0;
+}
+function tornEdge(a, b, seed, amp = 9, seg = 7) {        // torn paper: fibrous jagged edge between a and b
+  const r = rng(seed), out = [], L = Math.hypot(b[0] - a[0], b[1] - a[1]), n = Math.ceil(L / seg);
+  const nx = -(b[1] - a[1]) / L, ny = (b[0] - a[0]) / L; let w = 0;
+  for (let i = 0; i <= n; i++) { const u = i / n; w = w * 0.6 + (r() * 2 - 1) * amp * 0.7; const o = w + (r() * 2 - 1) * amp * 0.35; out.push([lerp(a[0], b[0], u) + nx * o, lerp(a[1], b[1], u) + ny * o]); }
+  return out;
+}
+// paper fill: base colour × the CC0 paper texture (multiply) — every piece of paper in the film is "real" paper
+function paperFill(c, w, h, base, sx = 0, sy = 0, k = 1) {
+  const t = mk(w, h), q = t.getContext('2d'); q.fillStyle = base; q.fillRect(0, 0, w, h);
+  const sw = Math.min(w * 1.6, I.paper.width), sh = Math.min(h * 1.6, I.paper.height);     // keep the source rect inside the texture
+  sx = sx % Math.max(1, I.paper.width - sw + 1); sy = sy % Math.max(1, I.paper.height - sh + 1);
+  q.globalCompositeOperation = 'multiply'; q.globalAlpha = k; q.drawImage(I.paper, sx, sy, sw, sh, 0, 0, w, h);
+  c.drawImage(t, 0, 0);                                   // drawn as one opaque tile, so the caller's composite op applies
+}
+// halftone: dot screen at 45°, dot radius from a tone map (0 = paper, 1 = solid)
+function halftone(w, h, toneCanvas, color, sp = 7, ang = 45, gain = 1) {
+  const out = mk(w, h), c = out.getContext('2d');
+  const td = toneCanvas.getContext('2d').getImageData(0, 0, w, h).data;
+  const ca = Math.cos(ang * DEG), sa = Math.sin(ang * DEG), R = Math.hypot(w, h);
+  c.fillStyle = color;
+  for (let j = -R / sp; j < R / sp; j++) for (let i = -R / sp; i < R / sp; i++) {
+    const x = w / 2 + (i * ca - j * sa) * sp, y = h / 2 + (i * sa + j * ca) * sp;
+    if (x < -sp || y < -sp || x > w + sp || y > h + sp) continue;
+    const xi = clamp(Math.round(x), 0, w - 1), yi = clamp(Math.round(y), 0, h - 1), o = (yi * w + xi) * 4;
+    if (td[o + 3] < 8) continue;
+    const tone = clamp((1 - td[o] / 255) * gain * td[o + 3] / 255);
+    const r = sp * 0.72 * Math.sqrt(tone);
+    if (r < 0.35) continue;
+    c.beginPath(); c.arc(x, y, r, 0, 2 * PI); c.fill();
+  }
+  return out;
+}
+// white scissor edge: dilate the silhouette (cutout mask) with a rough radius, fill white, then put the print on top
+function withEdge(maskCanvas, contentCanvas, edge = 5, seed = 1) {
+  const w = maskCanvas.width + edge * 4, h = maskCanvas.height + edge * 4, out = mk(w, h), c = out.getContext('2d');
+  const r = rng(seed);
+  for (let a = 0; a < 32; a++) { const rr = edge * (0.75 + 0.5 * r()), th = a / 32 * 2 * PI; c.drawImage(maskCanvas, edge * 2 + Math.cos(th) * rr, edge * 2 + Math.sin(th) * rr); }
+  c.globalCompositeOperation = 'source-in'; paperFill(c, w, h, P.white, 300, 200, 0.6);
+  c.globalCompositeOperation = 'source-over'; c.drawImage(contentCanvas, edge * 2, edge * 2);
+  return out;
+}
+function toneOf(prims, w, h, light) {                   // grayscale tone map: each primitive filled with its tone
+  const t = mk(w, h), c = t.getContext('2d');
+  for (const p of prims) { const v = Math.round(255 * (1 - p.tone)); c.fillStyle = `rgb(${v},${v},${v})`; c.fill(new Path2D(p.d)); }
+  if (light) { c.globalCompositeOperation = 'source-atop'; const g = c.createRadialGradient(light[0], light[1], 10, light[0], light[1], light[2]); g.addColorStop(0, 'rgba(255,255,255,.34)'); g.addColorStop(1, 'rgba(0,0,0,.12)'); c.fillStyle = g; c.fillRect(0, 0, w, h); }
+  return t;
+}
+function maskOf(prims, w, h) { const m = mk(w, h), c = m.getContext('2d'); c.fillStyle = '#000'; for (const p of prims) c.fill(new Path2D(p.d)); return m; }
+function printPiece(prims, w, h, { ink = P.ink, sp = 7, light = null, under = '#e9e3d3', seed = 1, edge = 5 } = {}) {
+  const mask = maskOf(prims, w, h), tone = toneOf(prims, w, h, light);
+  const dots = halftone(w, h, tone, ink, sp);
+  const content = mk(w, h), c = content.getContext('2d');
+  c.drawImage(mask, 0, 0); c.globalCompositeOperation = 'source-in'; paperFill(c, w, h, under, 900, 600, 0.9);
+  c.globalCompositeOperation = 'source-atop'; c.drawImage(dots, 0, 0);
+  return withEdge(mask, content, edge, seed);
+}
+const ell = (cx, cy, rx, ry) => `M ${cx - rx} ${cy} A ${rx} ${ry} 0 1 0 ${cx + rx} ${cy} A ${rx} ${ry} 0 1 0 ${cx - rx} ${cy} Z`;
+
+// ------------------------------------------------------------------ build the pieces once
+// 1) background page: paper + newsprint columns + torn strips (static)
+const BG = mk(W, H); {
+  const c = BG.getContext('2d'); paperFill(c, W, H, P.paper, 0, 0, 1);
+  const news = (x, y, w, h, rot, seed, head) => {         // a clipped newspaper column: headline + greeked body lines
+    const n = mk(w, h), q = n.getContext('2d'); paperFill(q, w, h, P.news, seed * 37 % 1800, seed * 53 % 900, 1);
+    const r = rng(seed); q.fillStyle = 'rgba(34,40,42,.82)'; q.font = `400 34px ${CJK}`; q.textBaseline = 'top'; q.fillText(head, 22, 20);
+    q.fillRect(22, 66, w - 44, 2);
+    for (let yy = 82; yy < h - 18; yy += 15) { const ww = (w - 44) * (yy % 150 > 135 ? 0.45 + r() * 0.3 : 0.92 + r() * 0.08); q.fillStyle = 'rgba(34,40,42,.30)'; q.fillRect(22, yy, ww, 6); }
+    c.save(); c.translate(x, y); c.rotate(rot * DEG); c.shadowColor = 'rgba(34,40,42,.18)'; c.shadowBlur = 6; c.shadowOffsetY = 3;
+    const cut = cutRect(w, h, seed, 4); c.beginPath(); poly(c, cut); c.clip(); c.drawImage(n, 0, 0); c.restore();
+  };
+  news(60, 40, 330, 430, -3, 11, '本刊讯');
+  news(1580, 600, 300, 470, 4, 12, '读者来信');
+  news(760, 760, 420, 300, -1.5, 13, '纪实与修辞');
+  // big colour blocks under the cutouts (constructivist geometry)
+  c.save(); c.globalCompositeOperation = 'multiply';
+  c.fillStyle = P.blue; c.globalAlpha = 0.92; c.beginPath(); c.arc(1355, 470, 300, 0, 2 * PI); c.fill();
+  c.restore();
+  const strip = (a, b, wdt, col, seed) => {              // torn paper strip
+    const dx = b[0] - a[0], dy = b[1] - a[1], L = Math.hypot(dx, dy), nx = -dy / L * wdt / 2, ny = dx / L * wdt / 2;
+    const top = tornEdge([a[0] + nx, a[1] + ny], [b[0] + nx, b[1] + ny], seed, 7), bot = tornEdge([b[0] - nx, b[1] - ny], [a[0] - nx, a[1] - ny], seed + 1, 7);
+    const s = mk(W, H), q = s.getContext('2d'); poly(q, [...top, ...bot]); q.fillStyle = '#000'; q.fill();
+    q.globalCompositeOperation = 'source-in'; paperFill(q, W, H, col, seed * 91 % 1500, 300, 0.8);
+    c.save(); c.shadowColor = 'rgba(34,40,42,.2)'; c.shadowBlur = 5; c.shadowOffsetY = 2; c.drawImage(s, 0, 0); c.restore();
+  };
+  strip([-40, 640], [520, 600], 64, P.blue, 21);
+  strip([1180, 1110], [1960, 930], 54, P.ink, 22);
+}
+
+// 2) the documentary piece: ONE silhouette of a mother (hand at her chin) with two children turned away. No facial detail.
+const MOM_W = 660, MOM_H = 780;
+const MOM = printPiece([
+  { tone: 0.74, d: 'M 112 470 C 140 372 236 336 330 334 C 430 334 520 372 552 470 L 586 780 L 82 780 Z' },          // her coat
+  { tone: 0.60, d: 'M 30 780 L 52 520 C 62 444 118 414 172 420 C 240 428 262 480 266 540 L 276 780 Z' },          // child, left (back)
+  { tone: 0.62, d: 'M 398 780 L 404 548 C 404 476 446 430 506 428 C 572 428 616 470 622 530 L 640 780 Z' },       // child, right (back)
+  { tone: 0.88, d: ell(170, 352, 80, 88) },                                                                     // left child's hair (head turned away)
+  { tone: 0.86, d: ell(502, 340, 78, 86) },                                                                     // right child's hair
+  { tone: 0.46, d: 'M 298 250 L 364 250 L 372 352 L 290 352 Z' },                                               // neck
+  { tone: 0.40, d: ell(332, 208, 74, 90) },                                                                     // her head (no features)
+  { tone: 0.90, d: 'M 254 214 C 246 132 286 104 334 104 C 388 104 420 138 412 214 C 398 168 372 146 332 146 C 292 146 266 170 254 214 Z' }, // hair
+  { tone: 0.26, d: 'M 222 640 C 236 560 262 430 280 300 L 324 312 C 318 420 296 560 286 650 Z' },              // forearm raised
+  { tone: 0.22, d: 'M 270 318 C 262 288 272 256 300 248 C 326 242 344 262 342 290 C 340 316 324 334 300 336 C 284 337 274 330 270 318 Z' }, // hand at chin
+  { tone: 0.50, d: 'M 196 560 C 214 520 252 510 284 520 L 300 660 L 200 680 Z' },                              // sleeve at the elbow
+], MOM_W, MOM_H, { light: [250, 160, 520], sp: 7, seed: 3, edge: 5 });
+
+// 3) the car ad: a schematic page of our own (not the original): car cut-out, headline "Lemon.", greeked body copy
+const AD_W = 560, AD_H = 680;
+const AD = mk(AD_W, AD_H); {
+  const c = AD.getContext('2d'), cut = cutRect(AD_W, AD_H, 41, 4);
+  c.save(); poly(c, cut); c.clip(); paperFill(c, AD_W, AD_H, '#efe9d9', 1200, 400, 1);
+  c.strokeStyle = 'rgba(34,40,42,.55)'; c.lineWidth = 1.5; c.strokeRect(26, 26, AD_W - 52, AD_H - 52);
+  c.fillStyle = P.ink; c.font = `700 112px ${SERIF}`; c.textBaseline = 'alphabetic'; c.fillText('Lemon.', 46, 470);
+  const r = rng(42);
+  for (let col = 0; col < 3; col++) for (let yy = 506; yy < 630; yy += 13) { c.fillStyle = 'rgba(34,40,42,.42)'; c.fillRect(46 + col * 160, yy, (yy > 610 && col === 2 ? 70 : 142) + r() * 6 - 6, 5); }
+  c.restore();
+}
+// car (generic domed small car, side view, facing left): body cut-out + a separate hinged front lid (the "mouth")
+const CAR_W = 470, CAR_H = 250;
+const carBody = [
+  { tone: 0.80, d: 'M 140 84 C 196 26 268 18 320 26 C 382 36 424 84 446 150 C 456 182 452 204 436 210 L 40 210 C 26 206 24 186 34 168 C 50 150 90 140 120 136 Z' },
+  { tone: 0.22, d: 'M 176 86 C 210 52 252 44 284 46 L 288 112 L 168 114 Z' },
+  { tone: 0.22, d: 'M 304 48 C 344 54 372 80 388 112 L 308 112 Z' },
+  { tone: 0.96, d: ell(122, 206, 40, 40) }, { tone: 0.96, d: ell(372, 206, 40, 40) },
+  { tone: 0.35, d: ell(122, 206, 14, 14) }, { tone: 0.35, d: ell(372, 206, 14, 14) },
+];
+const CAR = printPiece(carBody, CAR_W, CAR_H, { light: [260, 40, 300], sp: 6, seed: 5, edge: 4 });
+const LID_W = 140, LID_H = 90;                             // front lid, hinge at its top-right (base of the windscreen)
+const LID = printPiece([{ tone: 0.74, d: 'M 128 6 L 136 64 L 8 76 C 6 60 24 52 54 44 C 82 36 104 22 128 6 Z' }], LID_W, LID_H, { light: [100, 0, 140], sp: 6, seed: 6, edge: 4 });
+// lemon: halftone fruit, disproportionate (bigger than the car's lid)
+const LEM_W = 300, LEM_H = 210;
+const LEMON = printPiece([
+  { tone: 0.55, d: 'M 14 108 C 30 62 78 22 150 20 C 222 20 270 60 288 104 C 270 152 222 190 150 190 C 78 190 30 152 14 108 Z' },
+  { tone: 0.80, d: 'M 140 20 C 146 6 160 2 172 8 C 162 12 154 18 152 24 Z' },
+], LEM_W, LEM_H, { ink: P.blue, light: [110, 60, 200], sp: 6, seed: 7, edge: 5 });
+// rubber stamp (the object): wooden knob + block, red rubber face
+const ST_W = 460, ST_H = 420;
+const STAMP = printPiece([
+  { tone: 0.62, d: ell(230, 92, 92, 78) },
+  { tone: 0.75, d: 'M 196 150 L 264 150 L 276 250 L 184 250 Z' },
+  { tone: 0.82, d: 'M 30 250 L 430 250 L 440 370 L 20 370 Z' },
+], ST_W, ST_H, { light: [180, 40, 260], sp: 7, seed: 8, edge: 5 });
+const RUB = mk(ST_W, 50); { const c = RUB.getContext('2d'); paperFill(c, ST_W, 50, P.red, 0, 0, 0.7); }
+// the impression "次品": rubber-stamp grunge (noise specks and dry streaks knocked out)
+const IMP_W = 420, IMP_H = 240;
+const IMP = mk(IMP_W, IMP_H); {
+  const c = IMP.getContext('2d'); c.strokeStyle = P.red; c.fillStyle = P.red;
+  c.lineWidth = 9; c.beginPath(); c.roundRect(10, 10, IMP_W - 20, IMP_H - 20, 22); c.stroke();
+  c.lineWidth = 3; c.beginPath(); c.roundRect(26, 26, IMP_W - 52, IMP_H - 52, 14); c.stroke();
+  c.font = `400 132px ${CJK}`; c.textAlign = 'center'; c.textBaseline = 'middle';
+  c.lineWidth = 5; c.lineJoin = 'round'; c.strokeText('次 品', IMP_W / 2, 108); c.fillText('次 品', IMP_W / 2, 108);
+  c.font = `400 24px ${CJK}`; c.fillText('检 验 不 合 格  ·  1960', IMP_W / 2, 190);
+  c.globalCompositeOperation = 'destination-out'; const r = rng(9);
+  for (let i = 0; i < 2600; i++) { c.globalAlpha = 0.25 + r() * 0.75; c.beginPath(); c.arc(r() * IMP_W, r() * IMP_H, 0.4 + r() * r() * 3.2, 0, 2 * PI); c.fill(); }
+  for (let i = 0; i < 26; i++) { c.globalAlpha = 0.18 + r() * 0.3; c.fillRect(r() * IMP_W, r() * IMP_H, 30 + r() * 120, 1 + r() * 2.5); }
+}
+// text scraps (cut from newsprint): text, colours, size → canvas with a scissor-cut outline
+function scrap(text, { size = 56, fg = P.ink, bg = P.news, font = CJK, w8 = 400, padX = 0.34, padY = 0.26, seed = 1 } = {}) {
+  const m = mk(10, 10).getContext('2d'); m.font = `${w8} ${size}px ${font}`;
+  const tw = m.measureText(text).width, w = tw + size * padX * 2, h = size * (1 + padY * 2);
+  const out = mk(w, h), c = out.getContext('2d'), cut = cutRect(w, h, seed, Math.max(2, size * 0.05));
+  c.save(); poly(c, cut); c.clip(); paperFill(c, w, h, bg, seed * 131 % 2400, seed * 77 % 1200, bg === P.ink ? 0.4 : 0.9);
+  c.fillStyle = fg; c.font = `${w8} ${size}px ${font}`; c.textBaseline = 'middle'; c.fillText(text, size * padX, h / 2 + size * 0.04); c.restore();
+  return out;
+}
+const S = {
+  chip36: scrap('1936 · 纪实摄影', { size: 34, seed: 31 }),
+  chip60: scrap('1960 · 汽车广告', { size: 34, seed: 32, fg: P.paper, bg: P.ink }),
+  sp1: scrap('这辆车', { size: 62, seed: 33, bg: P.white }),
+  sp2: scrap('没通过', { size: 62, seed: 34, fg: P.paper, bg: P.ink }),
+  sp3: scrap('检验。', { size: 62, seed: 35, fg: P.paper, bg: P.red }),
+  t1: scrap('看起来', { size: 132, seed: 51, fg: P.paper, bg: P.ink }),
+  t2: scrap('坦诚，', { size: 132, seed: 52, fg: P.paper, bg: P.red }),
+  t3: scrap('就值得', { size: 132, seed: 53, bg: P.news }),
+  t4: scrap('相信吗？', { size: 132, seed: 54, fg: P.paper, bg: P.blue }),
+  mast: scrap('异日观察室 · UPON · 2026-10-20', { size: 44, seed: 55, bg: P.white, padX: 0.6 }),
+};
+// manicule ☞ (a printer's fist, glyph from DejaVu Sans), halftone + white edge
+function glyphPiece(ch, size, seed, flip = false) {
+  const w = size * 1.15, h = size * 0.8, m = mk(w, h), c = m.getContext('2d');
+  c.font = `400 ${size}px ${SYM}`; c.textBaseline = 'middle'; c.textAlign = 'center';
+  if (flip) { c.translate(w, 0); c.scale(-1, 1); }
+  c.fillStyle = '#000'; c.fillText(ch, w / 2, h / 2);
+  const tone = mk(w, h), t = tone.getContext('2d'); t.drawImage(m, 0, 0); t.globalCompositeOperation = 'source-in'; t.fillStyle = 'rgb(40,40,40)'; t.fillRect(0, 0, w, h);
+  const dots = halftone(Math.ceil(w), Math.ceil(h), tone, P.ink, 5);
+  const content = mk(w, h), q = content.getContext('2d'); q.drawImage(m, 0, 0); q.globalCompositeOperation = 'source-in'; paperFill(q, w, h, '#e9e3d3', 0, 0, 1);
+  q.globalCompositeOperation = 'source-atop'; q.drawImage(dots, 0, 0);
+  return withEdge(m, content, 5, seed);
+}
+const HANDR = glyphPiece('☛', 230, 61), HANDL = glyphPiece('☛', 230, 62, true);
+// confetti bits (paper scraps that burst out under the stamp)
+const BITS = Array.from({ length: 16 }, (_, i) => {
+  const r = rng(700 + i), w = 18 + r() * 34, h = 10 + r() * 22, col = [P.news, P.red, P.blue, P.white, P.ink][i % 5];
+  const b = mk(w + 4, h + 4), c = b.getContext('2d'); poly(c, cutRect(w, h, 800 + i, 2)); c.fillStyle = col; c.fill();
+  const a = -PI / 2 + (r() * 2 - 1) * 1.5, sp = 520 + r() * 520, rest = 0.42 + r() * 0.2;
+  let vx = Math.cos(a) * sp; if (1335 + vx * rest * 1.25 < 900) vx = -vx;   // never lands on the documentary photo
+  return { img: b, vx, vy: Math.sin(a) * sp, spin: (r() * 2 - 1) * 9, rest };
+});
+// end sheet: a full page with a torn left edge (slides over everything, then slaps down)
+const SH_W = W + 260, SH_H = H + 160;
+const SHEET = mk(SH_W, SH_H); {
+  const c = SHEET.getContext('2d');
+  const left = tornEdge([150, SH_H], [110, 0], 91, 12, 8);
+  poly(c, [...left, [SH_W, 0], [SH_W, SH_H]]); c.fillStyle = '#000'; c.fill();
+  c.globalCompositeOperation = 'source-in'; paperFill(c, SH_W, SH_H, P.paper, 1500, 700, 1);
+  c.globalCompositeOperation = 'source-atop';
+  c.globalAlpha = 0.9; c.fillStyle = P.blue; c.beginPath(); c.arc(130 + 1500, 80 + 330, 230, 0, 2 * PI); c.fill();  // colour block behind the title
+  c.globalAlpha = 1; c.fillStyle = P.ink; c.fillRect(130 + 230, 80 + 718, 1360, 3);                                 // rule under the title
+}
+
+// ------------------------------------------------------------------ draw helpers
+function piece(img, x, y, rot, s = 1, lift = 0, sh = 1) {       // centre-anchored cut-out with paper shadow
+  X.save(); X.translate(x, y); X.rotate(rot); X.scale(s, s);
+  X.shadowColor = `rgba(24,28,30,${0.30 * sh})`; X.shadowBlur = 6 + lift * 34; X.shadowOffsetX = 4 + lift * 22; X.shadowOffsetY = 6 + lift * 30;
+  X.drawImage(img, -img.width / 2, -img.height / 2); X.restore();
+}
+function slapped(img, t, t0, x, y, rot, id, { pre = 3, amp = 1.6, fps = 6, sh = 1 } = {}) {
+  const sl = slap(t, t0, pre); if (!sl) return false;
+  const j = sl.k >= 2 ? jit(id, t, amp, fps) : jit(id, t, 0.5, 12);
+  const fly = sl.lift > 0 ? sl.lift : 0;                       // comes in from slightly up-right of its spot
+  piece(img, x + j[0] + fly * 70, y + j[1] - fly * 90, rot + j[2] + fly * 6 * DEG, sl.s, sl.lift, sh);
+  return true;
+}
+function tape(x, y, rot, len, seed) {
+  X.save(); X.translate(x, y); X.rotate(rot); X.globalAlpha = 0.86; X.filter = 'hue-rotate(160deg) saturate(.35) brightness(1.18)';
+  X.drawImage(I.tape, (seed * 211) % 900, 0, len * 1.5, 300, -len / 2, -22, len, 44); X.restore();
+}
+
+// pencil doodles (seeded wobble, round caps); RING is in ad-page coordinates, QM in frame coordinates
+const RING = (() => { const r = rng(77), o = []; for (let i = 0; i <= 140; i++) { const a = -2.6 + i / 140 * 2 * PI * 1.08, w = 1 + (r() - 0.5) * 0.04; o.push([-92 + Math.cos(a) * 178 * w, 96 + Math.sin(a) * 66 * w]); } return o; })();
+const QM = samplePath('M 1560 1010 C 1548 958 1600 930 1630 952 C 1660 976 1640 1004 1610 1012 C 1596 1016 1594 1030 1596 1046 M 1597 1066 L 1598 1070', 4);
+function doodle(t, t0, pts, pos, steps) {
+  const kk = ks(t, t0); if (kk < 0) return;
+  const n = Math.max(2, Math.round(pts.length * Math.min(1, (kk + 1) / steps)));
+  X.save(); X.translate(pos[0], pos[1]); X.rotate(pos[2]); X.strokeStyle = P.red; X.lineWidth = 7; X.lineCap = 'round'; X.lineJoin = 'round'; X.globalAlpha = 0.9;
+  X.globalCompositeOperation = 'multiply'; X.beginPath();
+  for (let i = 0; i < n; i++) { const [x, y] = pts[i]; if (i && Math.hypot(x - pts[i - 1][0], y - pts[i - 1][1]) > 16) X.moveTo(x, y); else if (i) X.lineTo(x, y); else X.moveTo(x, y); }
+  X.stroke(); X.restore();
+}
+// ------------------------------------------------------------------ the frame
+const MOM_POS = [505, 588, -2.2 * DEG], AD_POS = [1355, 545, 3.2 * DEG];
+function adLayer(t) {                                          // the ad page with the car puppet + its lid "mouth"
+  const L = mk(AD_W + 40, AD_H + 40), c = L.getContext('2d');  // (rendered per frame so the lid hinge animates)
+  c.translate(20, 20); c.drawImage(AD, 0, 0);
+  const cx = 50, cy = 70;
+  // lid pose by replacement frames: closed / half / open (3 hits), the hood then snaps shut
+  let ang = 0;
+  for (const h of C.hood) { const k = ks(t, h); if (k === 0) ang = 32; else if (k === 1) ang = 18; else if (k === 2) ang = 6; }
+  if (ks(t, C.lemon_pop) >= 0 && ks(t, C.lemon_pop) < 2) ang = 42;
+  if (ang > 0) { c.fillStyle = P.ink; c.beginPath(); c.moveTo(cx + 42, cy + 126); c.lineTo(cx + 168, cy + 92); c.lineTo(cx + 168, cy + 150); c.lineTo(cx + 40, cy + 166); c.closePath(); c.fill(); } // mouth interior
+  c.save(); c.shadowColor = 'rgba(24,28,30,.25)'; c.shadowBlur = 4; c.shadowOffsetY = 3; c.drawImage(CAR, cx, cy); c.restore();
+  c.save(); c.translate(cx + 32 + 132, cy + 84); c.rotate(-ang * DEG); c.drawImage(LID, -132 - 4, -8); c.restore();
+  return L;
+}
+
+window.renderAt = async (t) => {
+  t = Math.min(Math.max(t, 0), 9.9999);
+  const k = K(t);
+  X.setTransform(1, 0, 0, 1, 0, 0); X.globalAlpha = 1; X.filter = 'none';
+  // camera: stepped rostrum push-in over the first act, shake on the stamp
+  let shx = 0, shy = 0; const kh = ks(t, C.hero);
+  if (kh >= 0 && kh < 4) { shx = [9, -7, 4, -1][kh]; shy = [-7, 6, -3, 1][kh]; }
+  const zoom = 1 + 0.035 * clamp(Math.floor(t * 6) / 6 / 6);
+  X.translate(W / 2 + shx, H / 2 + shy); X.scale(zoom, zoom); X.translate(-W / 2, -H / 2);
+  const sheetK = ks(t, C.sheet_slap);
+  if (sheetK < 2) {
+    X.drawImage(BG, 0, 0);
+    // ink band slides in UNDER the pictures (colour-block layer), so nothing is ever pasted over the photo
+    const ki = ks(t, C.band_ink);
+    if (ki >= 0) {
+      const u = [0.5, 0.94, 1.02, 1][Math.min(ki, 3)];
+      X.save(); X.translate(-200 + u * 520, 128); X.rotate(-5 * DEG);
+      X.fillStyle = P.ink; X.fillRect(-420, -26, 1000, 52);
+      X.fillStyle = P.paper; X.font = `400 28px ${CJK}`; X.textBaseline = 'middle'; X.letterSpacing = '10px';
+      X.fillText('一张照片 · 一则广告', -250, 2); X.letterSpacing = '0px'; X.restore();
+    }
+    // act 1 — the documentary photo, slid in by an unseen hand and slapped down (one piece, kept whole)
+    {
+      const kin = ks(t, C.slap_mother);
+      const j = kin >= 2 ? jit(1, t, 1.4, 6) : [0, 0, 0];
+      if (kin < 0) { const u = -kin / 4; piece(MOM, MOM_POS[0] - u * u * 760, MOM_POS[1] + u * 40, MOM_POS[2] - u * 9 * DEG, 1 + 0.06 * u, 0.6 * u); }
+      else { const sl = slap(t, C.slap_mother); piece(MOM, MOM_POS[0] + j[0], MOM_POS[1] + j[1], MOM_POS[2] + j[2], kin === 0 ? 0.985 : 1, kin === 0 ? 0 : sl.lift); }
+    }
+    if (ks(t, C.tapes[0]) >= 0) tape(275, 228, -38 * DEG, 150, 1);
+    if (ks(t, C.tapes[1]) >= 0) tape(745, 1000, -28 * DEG, 140, 2);
+    slapped(S.chip36, t, C.chip1936, 330, 1018, -4 * DEG, 3);
+    // the car ad slides in from the right and slaps down
+    {
+      const kin = ks(t, C.slap_ad), a0 = Math.round(C.ad_in * 12) - Math.round(C.slap_ad * 12);
+      if (kin >= a0) {
+        const L = adLayer(t), j = kin >= 2 ? jit(4, t, 1.4, 6) : [0, 0, 0];
+        if (kin < 0) { const u = kin / a0; piece(L, AD_POS[0] + u * u * 820, AD_POS[1] - u * 60, AD_POS[2] + u * 10 * DEG, 1 + 0.08 * u, 0.7 * u); }
+        else piece(L, AD_POS[0] + j[0], AD_POS[1] + j[1], AD_POS[2] + j[2], kin === 0 ? 0.985 : 1, kin === 1 ? 0.05 : 0);
+        // the stamp impression is printed onto the ad page (multiply ink)
+        if (kh >= 0) {
+          X.save(); X.translate(AD_POS[0] + j[0] + 14, AD_POS[1] + j[1] + 196); X.rotate(-7 * DEG); X.globalCompositeOperation = 'multiply'; X.globalAlpha = kh === 0 ? 1 : 0.93;
+          X.drawImage(IMP, -IMP_W / 2, -IMP_H / 2); X.restore();
+        }
+      }
+    }
+    slapped(S.chip60, t, C.chip1960, 1600, 948, 3 * DEG, 5);
+    // the car talks: three speech scraps, slapped on each lid flap (arc up-left from the mouth)
+    const SP = [[S.sp1, 1010, 168, -5], [S.sp2, 925, 282, 3], [S.sp3, 1040, 392, -2]];
+    SP.forEach(([img, x, y, r], i) => {
+      if (ks(t, C.hood[i]) >= -1 && ks(t, C.band_red) < 0) slapped(img, t, C.hood[i], x, y, r * DEG, 10 + i, { pre: 1 });
+      else if (ks(t, C.band_red) >= 0 && ks(t, C.band_red) < 3) {               // swept off the page by the red band
+        const u = (ks(t, C.band_red) + 1) / 3; piece(img, x - u * u * 900, y - u * 120, (r - u * 40) * DEG, 1, 0.4);
+      }
+    });
+    // the lemon pops out of the lid on a stepped arc and lands between the two pictures (surreal scale jump)
+    {
+      const kp = ks(t, C.lemon_pop), n = Math.round((C.lemon_land - C.lemon_pop) * 12);
+      if (kp >= 0) {
+        const u = Math.min(1, kp / n), x = lerp(1170, 960, u), y = lerp(330, 640, u) - Math.sin(u * PI) * 210;
+        const s = kp === n ? 0.96 : lerp(0.35, 1, Math.min(1, u * 1.6)), j = kp > n + 1 ? jit(20, t, 1.4, 6) : [0, 0, 0];
+        piece(LEMON, x + j[0], y + j[1], lerp(-40, 16, u) * DEG + j[2], s, kp < n ? 0.5 : 0);
+      }
+    }
+    // constructivist diagonals: red band (top right, swings in) + ink band (bottom left)
+    {
+      const kb = ks(t, C.band_red);
+      if (kb >= 0) {
+        const u = [0.55, 0.92, 1.03, 1][Math.min(kb, 3)];
+        X.save(); X.translate(1300 + (1 - u) * 900, 150); X.rotate(-11 * DEG);
+        X.shadowColor = 'rgba(24,28,30,.28)'; X.shadowBlur = 8; X.shadowOffsetY = 6;
+        X.fillStyle = P.red; X.beginPath(); X.moveTo(-760, -62); X.lineTo(900, -62); X.lineTo(900, 62); X.lineTo(-700, 62); X.closePath(); X.fill();
+        X.shadowColor = 'transparent'; X.fillStyle = P.paper; X.font = `400 78px ${CJK}`; X.textBaseline = 'middle';
+        X.letterSpacing = '18px'; X.fillText('看起来坦诚', -560, 4); X.letterSpacing = '0px';
+        X.font = `700 30px ${SERIF}`; X.fillText('— 1936 / 1960', -10, 8); X.restore();
+      }
+    }
+    // the stamp: comes in giant (disproportionate), winds up, a beat of nothing, SLAM, lifts away
+    {
+      const kin = ks(t, C.stamp_in), kw0 = ks(t, C.windup[0]), kw1 = ks(t, C.windup[1]);
+      if (kin >= 0 && ks(t, C.lift) < 4) {
+        const tx = AD_POS[0] + 14, ty = AD_POS[1] + 196;              // impression centre
+        let x = tx + 40, y = ty - 330, s = 1.18, r = -14 * DEG, lift = 0.8;
+        if (kin < 4) { const u = 1 - kin / 4; x += u * 420; y -= u * 520; r += u * 20 * DEG; }
+        if (kw0 >= 0) { const u = clamp(kw0 / (kw1 - kw0 + 0.0001)); y -= 90 * Math.sin(u * PI / 2) + (kw0 % 4 < 2 ? 0 : 14) * (1 - u); r -= 6 * DEG * u; s = 1.18 + 0.06 * u; }
+        else if (kin >= 4) { y += (kin % 4 < 2 ? 0 : 10); r += (kin % 4 < 2 ? 0 : 1.5) * DEG; }  // anticipation: rises & tilts back
+        if (kh >= -2 && kh < 0) { y = ty - 330 - 90 + (kh + 2) * 170; r = -12 * DEG; s = 1.12; }     // the drop (two steps)
+        if (kh >= 0) { x = tx; y = ty - 168; r = -9 * DEG; s = kh === 0 ? 1.0 : 1.03; lift = kh === 0 ? 0 : 0.05; }
+        const kl = ks(t, C.lift);
+        if (kl >= 0) { const u = (kl + 1) / 4; y -= u * u * 900; x += u * 260; r += u * 18 * DEG; lift = 0.8; }
+        // squash on impact (stretch on the drop)
+        const sq = kh === 0 ? [1.06, 0.9] : (kh === -1 ? [0.94, 1.08] : [1, 1]);
+        X.save(); X.translate(x, y); X.rotate(r); X.scale(s * sq[0], s * sq[1]);
+        X.shadowColor = 'rgba(24,28,30,.34)'; X.shadowBlur = 8 + lift * 40; X.shadowOffsetX = 6 + lift * 40; X.shadowOffsetY = 8 + lift * 60;
+        X.drawImage(STAMP, -STAMP.width / 2, -STAMP.height / 2); X.shadowColor = 'transparent';
+        X.drawImage(RUB, -STAMP.width / 2 + 30, -STAMP.height / 2 + 368, ST_W - 40, 26); X.restore();
+      }
+      // confetti burst under the stamp, settling on the page
+      if (kh >= 0) {
+        const tt = (K(t) - Math.round(C.hero * 12)) / 12;
+        BITS.forEach((b, i) => {
+          const te = Math.min(tt, b.rest), g = 1500;
+          const x = AD_POS[0] + 14 + b.vx * te * 1.25, y = AD_POS[1] + 196 + b.vy * te + 0.5 * g * te * te;
+          piece(b.img, x, y, b.spin * te + i, 1, tt < b.rest ? 0.35 : 0, 0.6);
+        });
+      }
+    }
+    // red pencil doodles drawn on in 12 fps steps: a ring around "Lemon." on the ad, then a question mark in the margin
+    doodle(t, C.manicules[0] - 1 / 6, RING, AD_POS, 5);
+    doodle(t, C.manicules[1], QM, [-690, -110, 0], 4);
+    // manicules point at the two pictures: one at "1936", one at the stamp
+    slapped(HANDL, t, C.manicules[0], 96, 958, 6 * DEG, 30, { pre: 2 });
+    slapped(HANDR, t, C.manicules[1], 1770, 300, 150 * DEG, 31, { pre: 2 });
+  }
+  // act 3 — a fresh page slides over everything and slaps down; the question is pasted on in scraps
+  if (sheetK >= -4) {
+    let ox = 0, oy = 0, rr = 0, lift = 0;
+    if (sheetK < 0) { const u = -sheetK / 4; ox = -u * u * 2100 - u * 60; oy = -u * 120; rr = -u * 5 * DEG; lift = 0.9; }
+    if (sheetK === 0) { lift = 0; } if (sheetK === 1) { ox = 4; lift = 0.05; }
+    const j = sheetK >= 2 ? jit(40, t, 0.8, 6) : [0, 0, 0];
+    X.save(); X.translate(ox + j[0], oy + j[1]); X.rotate(rr);
+    X.shadowColor = 'rgba(24,28,30,.4)'; X.shadowBlur = 18 + lift * 30; X.shadowOffsetX = 14 + lift * 30;
+    X.drawImage(SHEET, -130, -80); X.restore();
+    if (sheetK >= 0) {
+      const T = [[S.t1, 640, 390, -2.5], [S.t2, 1146, 380, 2], [S.t3, 640, 590, 1.5], [S.t4, 1210, 600, -1.5]];
+      T.forEach(([img, x, y, r], i) => slapped(img, t, C.title[i], x, y, r * DEG, 50 + i, { pre: 2, amp: 1.2 }));
+      if (ks(t, C.masthead) >= -1) { tape(960, 812, -1 * DEG, 980, 5); slapped(S.mast, t, C.masthead, 960, 814, -0.8 * DEG, 60, { pre: 1, amp: 0.8 }); }
+      // the stamp's mark comes back small on the end card (6 fps boil)
+      if (ks(t, C.title[3]) >= 1) {
+        const j2 = jit(61, t, 1.0, 6); X.save(); X.translate(1620 + j2[0], 250 + j2[1]); X.rotate(12 * DEG); X.scale(0.5, 0.5);
+        X.globalCompositeOperation = 'multiply'; X.drawImage(IMP, -IMP_W / 2, -IMP_H / 2); X.restore();
+      }
+    }
+  }
+  // finishing: film grain (moves on the 12 fps grid), dust, soft vignette
+  X.setTransform(1, 0, 0, 1, 0, 0);
+  X.save(); X.globalCompositeOperation = 'overlay'; X.globalAlpha = 0.16;
+  const gx = (hash(900, k) * 1000) | 0, gy = (hash(901, k) * 900) | 0; X.drawImage(I.grain, gx, gy, 1100, 620, 0, 0, W, H); X.restore();
+  X.save(); X.globalAlpha = 0.35; X.globalCompositeOperation = 'multiply'; X.drawImage(I.dust, (k % 3) * 300, 0, 3840 - 900, 2160 - 500, 0, 0, W, H); X.restore();
+  const vg = X.createRadialGradient(W / 2, H / 2, H * 0.45, W / 2, H / 2, H * 1.05); vg.addColorStop(0, 'rgba(34,40,42,0)'); vg.addColorStop(1, 'rgba(34,40,42,.16)');
+  X.fillStyle = vg; X.fillRect(0, 0, W, H);
+};
+window.__ready = true;
+</script></body></html>

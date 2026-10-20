@@ -1,0 +1,193 @@
+<!doctype html>
+<html><head><meta charset="utf-8">
+<title>异日观察室 · 一笔画</title>
+<style>html,body{margin:0;background:#efebe1;overflow:hidden}canvas{display:block}#svg{position:absolute;left:-9px;top:-9px;width:1px;height:1px;overflow:hidden}</style>
+</head><body><canvas id="c" width="1920" height="1080"></canvas>
+<svg id="svg" xmlns="http://www.w3.org/2000/svg"></svg>
+<script type="module">
+// yiri-lineart — 异日观察室 2026-10-20「画面之外，还有多少？」 02-line-art technique, Canvas2D.
+// The whole film is ONE continuous ink line: a mother resting her chin on her hand (contour only, no facial features)
+// → the ground → a small domed car → the picture frame → at the last corner the line does not close the frame: it breaks
+// out and runs past the edge. Every frame is a pure function of t; the camera path is precomputed and smoothed.
+const W = 1920, H = 1080, D = '/demos/yiri-lineart/';
+window.DEMO = { width: W, height: H, fps: 30, duration: 10, motionBlur: { samples: 1 } };
+const cv = document.getElementById('c'), X = cv.getContext('2d');
+const C = await (await fetch(D + 'cues.json')).json();
+const load = src => new Promise((ok, no) => { const i = new Image(); i.onload = () => ok(i); i.onerror = () => no(src); i.src = src; });
+const PAPER = await load('/assets/textures/paper/Paper001_4K_color.jpg'); await PAPER.decode();
+const CJK = '"WenQuanYi Zen Hei"', SERIF = '"Caladea"';
+for (const f of [`400 60px ${CJK}`, `400 30px ${SERIF}`]) await document.fonts.load(f, '画面之外，还有多少？异日观察室·UPON2026-10');
+await document.fonts.ready;
+
+const P = { paper: '#efebe1', ink: '#22282a', blue: '#3f6277', red: '#ad3f2c' };
+const PI = Math.PI;
+const clamp = (x, a = 0, b = 1) => Math.min(b, Math.max(a, x));
+const lerp = (a, b, u) => a + (b - a) * u;
+const sstep = (a, b, x) => { const u = clamp((x - a) / (b - a)); return u * u * (3 - 2 * u); };
+const hex = h => [1, 3, 5].map(i => parseInt(h.slice(i, i + 2), 16));
+const mix = (a, b, u) => { const A = hex(a), B = hex(b); return `rgb(${A.map((v, i) => Math.round(lerp(v, B[i], u))).join(',')})`; };
+function bez(x1, y1, x2, y2) {                          // CSS cubic-bezier(x1,y1,x2,y2) as y(x)
+  return x => { if (x <= 0) return 0; if (x >= 1) return 1; let lo = 0, hi = 1, u = x;
+    for (let i = 0; i < 40; i++) { u = (lo + hi) / 2; const bx = 3 * (1 - u) ** 2 * u * x1 + 3 * (1 - u) * u * u * x2 + u ** 3; if (bx < x) lo = u; else hi = u; }
+    return 3 * (1 - u) ** 2 * u * y1 + 3 * (1 - u) * u * u * y2 + u ** 3; };
+}
+const EIO = bez(0.65, 0, 0.35, 1), EOUT = bez(0.22, 1, 0.36, 1);
+
+// ------------------------------------------------------------------ the line (world coords = the final poster)
+const PIECES = {
+  mother: 'M 290 846 C 288 760 296 680 318 640 ' +
+    'C 300 620 296 560 320 538 C 344 516 392 522 398 560 C 402 590 386 612 362 618 ' +                            // a child at her shoulder, head turned away
+    'C 396 606 420 560 430 520 ' +                                                                                // her shoulder and neck
+    'C 414 470 414 410 440 384 C 464 360 512 360 532 384 C 552 408 552 452 540 482 C 532 500 516 512 498 514 ' + // head, tilted (contour only, no features)
+    'C 512 520 528 512 540 500 C 552 490 566 498 562 516 C 558 532 548 540 548 556 ' +                            // fingers at the chin, knuckles, wrist
+    'C 556 610 584 680 600 724 ' +                                                                                // forearm down to the elbow
+    'C 616 700 640 650 652 610 ' +                                                                                // upper arm up to the shoulder
+    'C 690 640 704 740 704 846 L 798 846',                                                                        // her side down to the ground
+  car: 'M 798 846 C 800 834 808 812 822 810 C 838 808 846 826 842 840 C 838 852 816 854 806 842 C 798 832 790 818 794 806 ' +
+    'C 802 770 862 712 926 708 C 990 704 1032 744 1044 790 C 1056 800 1062 814 1058 830 C 1056 840 1048 846 1036 846 ' +
+    'C 1032 834 1026 812 1012 812 C 996 812 992 834 998 842 C 1004 850 1022 850 1032 846 L 1080 846',
+  frame: 'M 1080 846 L 1080 150 L 200 150 L 200 930 L 1080 930',
+  escape: 'M 1080 930 C 1146 930 1104 640 1196 640 C 1450 640 1700 632 1860 640 C 1960 645 2040 640 2140 638',
+};
+const svg = document.getElementById('svg');
+function sample(d, step = 2) {
+  const p = document.createElementNS('http://www.w3.org/2000/svg', 'path'); p.setAttribute('d', d); svg.appendChild(p);
+  const L = p.getTotalLength(), n = Math.max(4, Math.ceil(L / step)), o = [];
+  for (let i = 0; i <= n; i++) { const q = p.getPointAtLength(L * i / n); o.push([q.x, q.y]); }
+  p.remove(); return o;
+}
+// one polyline with arc length, a per-sample "time cost" that rises at corners (the pen slows into every turn)
+const PTS = [], S = [], COST = [], PIECE_AT = [];
+const RANGE = {};
+for (const name of ['mother', 'car', 'frame', 'escape']) {
+  const pts = sample(PIECES[name]); const a = PTS.length;
+  for (let i = PTS.length ? 1 : 0; i < pts.length; i++) PTS.push(pts[i]);
+  RANGE[name] = [Math.max(0, a - 1), PTS.length - 1];
+}
+for (let i = 0; i < PTS.length; i++) S.push(i ? S[i - 1] + Math.hypot(PTS[i][0] - PTS[i - 1][0], PTS[i][1] - PTS[i - 1][1]) : 0);
+const turn = PTS.map((p, i) => {
+  const a = PTS[Math.max(0, i - 5)], b = PTS[Math.min(PTS.length - 1, i + 5)];
+  const v1 = [p[0] - a[0], p[1] - a[1]], v2 = [b[0] - p[0], b[1] - p[1]];
+  const l = Math.hypot(...v1) * Math.hypot(...v2); if (l < 1e-6) return 0;
+  return Math.acos(clamp((v1[0] * v2[0] + v1[1] * v2[1]) / l, -1, 1));
+});
+const sm = turn.map((_, i) => { let s = 0, w = 0; for (let k = -8; k <= 8; k++) { const j = i + k; if (j < 0 || j >= turn.length) continue; const g = Math.exp(-k * k / 30); s += turn[j] * g; w += g; } return s / w; });
+const CUM = [0];
+for (let i = 1; i < PTS.length; i++) CUM.push(CUM[i - 1] + (S[i] - S[i - 1]) * (1 + 3.2 * clamp(sm[i] / (PI / 2))));
+// pen position (as an index along the line) at time t: inside a piece, eased time → cost → sample
+function penIndex(t) {
+  let idx = 0;
+  for (const name of ['mother', 'car', 'frame', 'escape']) {
+    const [t0, t1] = C.pieces[name], [a, b] = RANGE[name];
+    if (t <= t0) break;
+    const e = name === 'escape' ? bez(0.5, 0, 0.75, 1) : name === 'mother' ? bez(0.3, 0.25, 0.35, 1) : EIO;
+    const u = e(clamp((t - t0) / (t1 - t0)));
+    const target = CUM[a] + u * (CUM[b] - CUM[a]);
+    let lo = a, hi = b; while (hi - lo > 1) { const m = (lo + hi) >> 1; if (CUM[m] < target) lo = m; else hi = m; }
+    const f = (target - CUM[lo]) / Math.max(1e-9, CUM[hi] - CUM[lo]);
+    idx = lo + clamp(f);
+    if (t < t1) break;
+  }
+  return idx;
+}
+const at = i => { const a = Math.floor(i), b = Math.min(PTS.length - 1, a + 1), f = i - a; return [lerp(PTS[a][0], PTS[b][0], f), lerp(PTS[a][1], PTS[b][1], f)]; };
+const lenAt = i => { const a = Math.floor(i), b = Math.min(PTS.length - 1, a + 1); return lerp(S[a], S[b], i - a); };
+
+// ------------------------------------------------------------------ the virtual camera (precomputed, smoothed: pure function of t)
+const CAM_HZ = 60, NCAM = 10 * CAM_HZ + 1;
+const rawCam = Array.from({ length: NCAM }, (_, i) => at(penIndex(i / CAM_HZ)));
+const CAM = rawCam.map((_, i) => { let x = 0, y = 0, w = 0; for (let k = -36; k <= 36; k++) { const j = clamp(i + k, 0, NCAM - 1), g = Math.exp(-k * k / (2 * 14 * 14)); x += rawCam[j][0] * g; y += rawCam[j][1] * g; w += g; } return [x / w, y / w]; });
+const ZK = [[0, 1.95], [1.6, 1.8], [3.2, 1.55], [4.6, 1.35], [5.6, 1.18], [6.45, 1.0], [10, 1.0]];
+function zoomAt(t) { for (let i = 1; i < ZK.length; i++) if (t <= ZK[i][0]) return lerp(ZK[i - 1][1], ZK[i][1], EIO((t - ZK[i - 1][0]) / (ZK[i][0] - ZK[i - 1][0]))); return 1; }
+function camera(t) {
+  const f = clamp(t * CAM_HZ, 0, NCAM - 1), a = Math.floor(f), b = Math.min(NCAM - 1, a + 1);
+  const c = [lerp(CAM[a][0], CAM[b][0], f - a), lerp(CAM[a][1], CAM[b][1], f - a)];
+  let z = zoomAt(t);
+  const w = EIO(clamp((t - C.poster_from) / (C.pieces.frame[1] - C.poster_from)));       // dolly out to the composed poster
+  let cx = lerp(c[0], 960, w), cy = lerp(c[1], 540, w);
+  const half = [W / 2 / z, H / 2 / z];                                                     // keep the view on the page
+  cx = clamp(cx, half[0] - 140, W - half[0] + 140); cy = clamp(cy, half[1] - 80, H - half[1] + 80);
+  const drift = sstep(C.end_hold, 10, t); z *= 1 + 0.012 * drift; cx += 6 * drift;         // living end frame: slow push
+  return [cx, cy, z];
+}
+window.penSpeed = t => { const a = at(penIndex(t)), b = at(penIndex(t + 1 / 120)); return Math.hypot(b[0] - a[0], b[1] - a[1]) * 120; };
+
+// ------------------------------------------------------------------ fills (line → surface): the picture, then the car
+const FILLC = mix(P.paper, P.blue, 0.36);
+const carPoly = (() => { const [a, b] = RANGE.car; const o = []; for (let i = a; i <= b; i++) { const p = PTS[i]; if (p[0] >= 792 && p[0] <= 1060 && S[i] - S[a] > 90 && S[i] - S[a] < 640) o.push(p); } o.push([1036, 838], [800, 838]); return o; })();
+
+// paper background (screen space, static)
+const BG = document.createElement('canvas'); BG.width = W; BG.height = H; {
+  const c = BG.getContext('2d'); c.fillStyle = P.paper; c.fillRect(0, 0, W, H);
+  c.globalCompositeOperation = 'multiply'; c.globalAlpha = 0.55; c.drawImage(PAPER, 400, 200, 3072, 1728, 0, 0, W, H);
+  c.globalCompositeOperation = 'source-over'; c.globalAlpha = 1;
+  const g = c.createRadialGradient(W / 2, H / 2, H * 0.5, W / 2, H / 2, H * 1.1); g.addColorStop(0, 'rgba(34,40,42,0)'); g.addColorStop(1, 'rgba(34,40,42,.10)');
+  c.fillStyle = g; c.fillRect(0, 0, W, H);
+}
+
+window.renderAt = async (t) => {
+  t = clamp(t, 0, 9.9999);
+  X.setTransform(1, 0, 0, 1, 0, 0); X.globalAlpha = 1; X.drawImage(BG, 0, 0);
+  const [cx, cy, z] = camera(t);
+  X.setTransform(z, 0, 0, z, W / 2 - cx * z, H / 2 - cy * z);
+  const pi = penIndex(t), pen = at(pi), Lpen = lenAt(pi);
+  const hes = t > C.pieces.frame[1] && t < C.break ? Math.sin(PI * clamp((t - C.pieces.frame[1]) / (C.break - C.pieces.frame[1]))) ** 2 : 0;
+  const nib = [pen[0] - 18 * hes, pen[1] + 6 * hes];                                    // wind-up before the break-out
+  // fills sit under the line
+  const fu = EOUT(clamp((t - C.fill[0]) / (C.fill[1] - C.fill[0])));
+  if (fu > 0) {
+    X.save(); X.beginPath(); X.rect(200, 150, 880, 780); X.clip();
+    X.fillStyle = FILLC; X.globalAlpha = 0.96; X.beginPath(); X.arc(1080, 930, 1200 * fu, 0, 2 * PI); X.fill();
+    X.restore();
+  }
+  const cu = EOUT(clamp((t - C.car_fill[0]) / (C.car_fill[1] - C.car_fill[0])));
+  if (cu > 0) {
+    X.save(); X.beginPath(); carPoly.forEach((p, i) => i ? X.lineTo(...p) : X.moveTo(...p)); X.closePath(); X.clip();
+    X.fillStyle = P.red; X.globalAlpha = 0.9; X.beginPath(); X.arc(1012, 830, 320 * cu, 0, 2 * PI); X.fill(); X.restore();
+  }
+  // the line: older segments dim to ~35 % while the camera moves on; the poster reveal brings them back to full ink
+  const restore = sstep(C.poster_from, C.pieces.frame[1] + 0.1, t);
+  const n = Math.floor(pi), BANDS = 14, paths = Array.from({ length: BANDS + 1 }, () => new Path2D());
+  let prevB = -1;
+  for (let i = 1; i <= n + 1 && i < PTS.length; i++) {
+    const q = i <= n ? PTS[i] : pen, p = PTS[i - 1];
+    const k = sstep(260, 900, Lpen - S[i]) * 0.65 * (1 - restore), b = Math.round(k / 0.65 * BANDS);
+    if (b !== prevB) { paths[b].moveTo(p[0], p[1]); prevB = b; }
+    paths[b].lineTo(q[0], q[1]);
+  }
+  X.lineCap = 'round'; X.lineJoin = 'round'; X.lineWidth = 3.2 / z;
+  for (let b = BANDS; b >= 0; b--) { X.strokeStyle = mix(P.ink, P.paper, 0.65 * b / BANDS); X.stroke(paths[b]); }
+  // the break: three short strokes flick off the corner as the line refuses to close the frame
+  const kb = t - C.break;
+  if (kb > 0 && kb < 0.45) {
+    const u = EOUT(kb / 0.18), fade = 1 - sstep(0.2, 0.45, kb);
+    X.strokeStyle = P.red; X.globalAlpha = fade; X.lineWidth = 3 / z;
+    for (const a of [-2.4, -1.85, -1.3, -0.75]) { const r0 = 18, r1 = 18 + 40 * u; X.beginPath(); X.moveTo(1080 + Math.cos(a) * r0, 930 + Math.sin(a) * r0); X.lineTo(1080 + Math.cos(a) * r1, 930 + Math.sin(a) * r1); X.stroke(); }
+    X.globalAlpha = 1;
+  }
+  // the pen tip: a faded-red nib dot leading the draw (hidden once it has left the page)
+  if (t < C.pieces.escape[1]) {
+    const breathe = t > C.pieces.frame[1] && t < C.break ? 1 + 0.25 * Math.sin((t - C.pieces.frame[1]) * 2 * PI * 3) : 1;
+    X.fillStyle = 'rgba(173,63,44,.18)'; X.beginPath(); X.arc(nib[0], nib[1], 13 / z * breathe, 0, 2 * PI); X.fill();
+    X.fillStyle = P.red; X.beginPath(); X.arc(nib[0], nib[1], 5 / z, 0, 2 * PI); X.fill();
+  }
+  // type (screen space, the poster is at zoom 1 by now): the question above the escaping line, the masthead below it
+  X.setTransform(z, 0, 0, z, W / 2 - cx * z, H / 2 - cy * z);
+  X.font = `400 104px ${CJK}`; X.textBaseline = 'alphabetic'; X.fillStyle = P.ink;
+  ['画面之外，', '还有多少？'].forEach((line, li) => {
+    let x = 1196;
+    for (let i = 0; i < line.length; i++) {
+      const u = EOUT(clamp((t - C.text - (li * 5 + i) * 0.05) / 0.4));
+      if (u > 0) { X.globalAlpha = u; X.fillText(line[i], x, [430, 566][li] + 16 * (1 - u)); }
+      x += X.measureText(line[i]).width + 12;
+    }
+  });
+  const mu = EOUT(clamp((t - C.masthead) / 0.5));
+  if (mu > 0) {
+    X.globalAlpha = mu; X.fillStyle = P.blue; X.font = `400 30px ${CJK}`; X.letterSpacing = `${lerp(14, 6, mu)}px`;
+    X.fillText('异日观察室 · UPON · 2026-10-20', 1200, 712); X.letterSpacing = '0px';
+  }
+  X.globalAlpha = 1;
+};
+window.__ready = true;
+</script></body></html>
